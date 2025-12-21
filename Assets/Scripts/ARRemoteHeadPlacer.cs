@@ -1,10 +1,13 @@
 // Assets/Scripts/ARRemoteHeadPlacer.cs
-// Unity 6 / AR Foundation 用：Ubuntuサーバの /latest.json を定期取得して「頭Prefab」を配置する
+// Unity 6 / AR Foundation 用：サーバの /latest.json を定期取得して「頭Prefab」を配置する
 // - debugSpawnInFront=true なら、GPS/コンパス権限なしで「カメラの1m前」に必ず出す（まず表示確認用）
 // - debugSpawnInFront=false なら、iPhoneのGPS/コンパスで「緯度経度→AR空間」へ配置する
 //
-// /latest.json 例（あなたのサーバはOK）:
+// /latest.json 例（データあり）:
 // {"ts":"...","yaw_deg":161.1,"pos":{"x":..,"y":..,"z":..},"lat":33.88,"lon":130.88,"alt":...,"calibrated":true,...}
+//
+// /latest.json 例（データなし）:
+// {"ok": false, "reason": "no_data"}
 
 using System;
 using System.Collections;
@@ -44,8 +47,9 @@ public class ARRemoteHeadPlacer : MonoBehaviour
         public double z;
     }
 
+    // データあり版（従来のlatest.json）
     [Serializable]
-    public class Latest
+    public class LatestData
     {
         public string ts;
         public double yaw_deg;
@@ -55,18 +59,33 @@ public class ARRemoteHeadPlacer : MonoBehaviour
         public double alt;
         public bool calibrated;
         public string calib_method;
+        public double calib_scale;
+        public double calib_theta_deg;
     }
 
-    private Latest latest;
+    // データなし版（{"ok":false,"reason":"no_data"}）
+    [Serializable]
+    public class NoDataResponse
+    {
+        public bool ok;
+        public string reason;
+    }
+
+    private LatestData latest;          // データありのときだけ入る
     private GameObject headObj;
     private Camera arCam;
 
     // Geo 変換用
     private bool geoReady = false;
+    private bool geoInitStarted = false;
     private Vector3 worldOriginPos;
     private double originLat;
     private double originLon;
     private Quaternion enuToWorldRot = Quaternion.identity;
+
+    // デバッグ用
+    private string lastServerMsg = "";
+    private float lastFetchTime = -999f;
 
     IEnumerator Start()
     {
@@ -107,34 +126,104 @@ public class ARRemoteHeadPlacer : MonoBehaviour
     IEnumerator FetchLatest()
     {
         string url = serverBaseUrl.TrimEnd('/') + "/latest.json";
+
         using (var req = UnityWebRequest.Get(url))
         {
             req.timeout = 3;
             yield return req.SendWebRequest();
 
+            lastFetchTime = Time.time;
+
             if (req.result != UnityWebRequest.Result.Success)
             {
-                Debug.LogWarning("[ARRemoteHeadPlacer] Fetch failed: " + req.error);
+                lastServerMsg = $"Fetch failed: {req.error}";
+                Debug.LogWarning("[ARRemoteHeadPlacer] " + lastServerMsg);
+                yield break; // 次ループでまた試す
+            }
+
+            string text = req.downloadHandler.text?.Trim() ?? "";
+            if (string.IsNullOrEmpty(text))
+            {
+                lastServerMsg = "Empty response";
+                Debug.LogWarning("[ARRemoteHeadPlacer] " + lastServerMsg);
                 yield break;
             }
 
+            // no_data レスポンス判定
+            // 重要：LatestData に ok を足すと、データありJSONでも ok=false になってしまうので分岐パースする
+            if (LooksLikeNoData(text))
+            {
+                try
+                {
+                    var nd = JsonUtility.FromJson<NoDataResponse>(text);
+                    if (nd != null && nd.ok == false)
+                    {
+                        latest = null; // ここが重要：変な0座標へ飛ばさない
+                        lastServerMsg = $"no_data: {nd.reason}";
+                        // Debug.Log("[ARRemoteHeadPlacer] " + lastServerMsg);
+                        yield break;
+                    }
+                }
+                catch (Exception e)
+                {
+                    // no_data っぽいけどパース失敗 → とりあえず latest null にして安全側
+                    latest = null;
+                    lastServerMsg = $"no_data parse failed: {e.Message}";
+                    Debug.LogWarning("[ARRemoteHeadPlacer] " + lastServerMsg);
+                    yield break;
+                }
+            }
+
+            // データありのJSONとしてパース
             try
             {
-                latest = JsonUtility.FromJson<Latest>(req.downloadHandler.text);
+                var parsed = JsonUtility.FromJson<LatestData>(text);
+                if (parsed == null)
+                {
+                    lastServerMsg = "LatestData parse returned null";
+                    Debug.LogWarning("[ARRemoteHeadPlacer] " + lastServerMsg);
+                    yield break;
+                }
+
+                // 追加の安全策：lat/lonが両方0は怪しい（no_dataが誤パースされた等）
+                if (Math.Abs(parsed.lat) < 1e-9 && Math.Abs(parsed.lon) < 1e-9)
+                {
+                    // ただし本当に(0,0)の可能性はほぼ無い想定なので安全側で弾く
+                    latest = null;
+                    lastServerMsg = "Suspicious lat/lon (0,0). Ignored.";
+                    Debug.LogWarning("[ARRemoteHeadPlacer] " + lastServerMsg);
+                    yield break;
+                }
+
+                latest = parsed;
+                lastServerMsg = "ok";
             }
             catch (Exception e)
             {
-                Debug.LogWarning("[ARRemoteHeadPlacer] JSON parse failed: " + e);
+                lastServerMsg = "JSON parse failed: " + e.Message;
+                Debug.LogWarning("[ARRemoteHeadPlacer] " + lastServerMsg);
             }
         }
     }
 
+    private bool LooksLikeNoData(string json)
+    {
+        // 最小限の判定（厳密パーサは使わない）
+        // {"ok": false, "reason": "no_data"} を想定
+        // ※将来サーバが "ok" を通常レスポンスに含める仕様になったらここを調整
+        return json.Contains("\"ok\"") && json.Contains("\"reason\"");
+    }
+
     IEnumerator InitGeoOrigin()
     {
+        if (geoInitStarted) yield break;
+        geoInitStarted = true;
+
         // Location
         if (!Input.location.isEnabledByUser)
         {
             Debug.LogError("[ARRemoteHeadPlacer] Location service disabled by user.");
+            geoInitStarted = false; // リトライ可能に戻す
             yield break;
         }
 
@@ -147,6 +236,7 @@ public class ARRemoteHeadPlacer : MonoBehaviour
         if (Input.location.status != LocationServiceStatus.Running)
         {
             Debug.LogError("[ARRemoteHeadPlacer] Location service not running.");
+            geoInitStarted = false; // リトライ可能に戻す
             yield break;
         }
 
@@ -198,15 +288,16 @@ public class ARRemoteHeadPlacer : MonoBehaviour
         // debug=false の場合、Geo初期化が必要
         if (!geoReady)
         {
-            // 起動後に debugSpawnInFront を false に変えた場合の保険
-            // ここで初期化を開始（1回だけ）
-            StartCoroutine(InitGeoOrigin());
+            // 起動後に debugSpawnInFront を false に変えた場合の保険（1回だけ起動）
+            if (!geoInitStarted)
+                StartCoroutine(InitGeoOrigin());
             return;
         }
 
+        // 最新データがない（no_data等）なら更新しない
         if (latest == null) return;
 
-        // latest.lat/lon が取れてる前提（あなたのサーバはOK）
+        // latest.lat/lon が取れてる前提
         double latT = latest.lat;
         double lonT = latest.lon;
 
@@ -248,5 +339,12 @@ public class ARRemoteHeadPlacer : MonoBehaviour
 
         headObj.transform.position = Vector3.Lerp(headObj.transform.position, targetPosGeo, posLerp);
         headObj.transform.rotation = Quaternion.Slerp(headObj.transform.rotation, targetRotGeo, rotLerp);
+    }
+
+    void OnDisable()
+    {
+        // 位置情報を使ってる場合だけ止めたいならここで判定してもOK
+        // Input.location.Stop();
+        // Input.compass.enabled = false;
     }
 }

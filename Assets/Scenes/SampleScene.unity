@@ -734,7 +734,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 6b859fec05e546d469000d6d1c5f086a, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  serverBaseUrl: http://192.168.3.14:8000
+  serverBaseUrl: http://49.212.200.195:8000
   pollIntervalSec: 0.2
   headPrefab: {fileID: 8655259909703409628, guid: 7413f855aef90bf4a8916c45608c8da2, type: 3}
   debugSpawnInFront: 1
