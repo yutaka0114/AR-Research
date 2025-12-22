@@ -551,6 +551,9 @@ PlayerSettings:
   - serializedVersion: 3
     m_BuildTarget: Android
     m_Formats: 03000000
+  - serializedVersion: 3
+    m_BuildTarget: iOS
+    m_Formats: 03000000
   playModeTestRunnerEnabled: 0
   runPlayModeTestAsEditModeTest: 0
   actionOnDotNetUnhandledException: 1
@@ -558,8 +561,8 @@ PlayerSettings:
   enableInternalProfiler: 0
   logObjCUncaughtExceptions: 1
   enableCrashReportAPI: 0
-  cameraUsageDescription: 
-  locationUsageDescription: 
+  cameraUsageDescription: "AR\u8868\u793A\u306E\u305F\u3081\u306B\u30AB\u30E1\u30E9\u3092\u4F7F\u7528\u3057\u307E\u3059"
+  locationUsageDescription: "AR\u8868\u793A\u4F4D\u7F6E\u5408\u308F\u305B\u306E\u305F\u3081\u306B\u4F4D\u7F6E\u60C5\u5831\u3092\u4F7F\u7528\u3057\u307E\u3059"
   microphoneUsageDescription: 
   bluetoothUsageDescription: 
   macOSTargetOSVersion: 11.0
@@ -941,6 +944,6 @@ PlayerSettings:
   hmiLoadingImage: {fileID: 0}
   platformRequiresReadableAssets: 0
   virtualTexturingSupportEnabled: 0
-  insecureHttpOption: 0
+  insecureHttpOption: 2
   androidVulkanDenyFilterList: []
   androidVulkanAllowFilterList: []
