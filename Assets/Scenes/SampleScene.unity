@@ -740,7 +740,7 @@ MonoBehaviour:
   debugSpawnInFront: 1
   debugFrontMeters: 1
   debugUseServerYaw: 1
-  maxDistanceMeters: 80
+  maxDistanceMeters: 1000
   yOffsetMeters: -0.2
   posLerp: 0.25
   rotLerp: 0.25
