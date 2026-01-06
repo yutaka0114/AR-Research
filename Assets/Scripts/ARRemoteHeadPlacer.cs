@@ -1,13 +1,11 @@
 // Assets/Scripts/ARRemoteHeadPlacer.cs
-// Unity 6 / AR Foundation 用：サーバの /latest.json を定期取得して「頭Prefab」を配置する
-// - debugSpawnInFront=true なら、GPS/コンパス権限なしで「カメラの1m前」に必ず出す（まず表示確認用）
+// Unity 6 / AR Foundation 用：サーバの /latest.json を定期取得して「リモートPrefab」を配置する
+// - debugSpawnInFront=true なら、GPS/コンパス権限なしで「カメラの前」に必ず出す（表示確認用）
 // - debugSpawnInFront=false なら、iPhoneのGPS/コンパスで「緯度経度→AR空間」へ配置する
 //
-// /latest.json 例（データあり）:
-// {"ts":"...","yaw_deg":161.1,"pos":{"x":..,"y":..,"z":..},"lat":33.88,"lon":130.88,"alt":...,"calibrated":true,...}
-//
-// /latest.json 例（データなし）:
-// {"ok": false, "reason": "no_data"}
+// 重要：サーバの pos.y は使わない（VR側のCityRootがどれだけマイナスでも影響させない）
+//      表示Yは AR起動時の目線高さ（または現在の目線高さ）を基準にする。
+//      Humanoid(例: UnityChan)なら、頭ボーンの高さを自動推定して「頭が目線の高さ」に来るよう補正できる。
 
 using System;
 using System.Collections;
@@ -17,26 +15,42 @@ using UnityEngine.Networking;
 public class ARRemoteHeadPlacer : MonoBehaviour
 {
     [Header("Server")]
-    public string serverBaseUrl = "http://192.168.3.14:8000";
+    public string serverBaseUrl = "http://49.212.200.195:8000";
     public float pollIntervalSec = 0.2f;
 
-    [Header("Prefab")]
+    [Header("Prefab (HeadでもUnityChanでもOK)")]
     public GameObject headPrefab;
 
-    [Header("Debug")]
-    public bool debugSpawnInFront = true;      // まずは true 推奨（権限無しでも見える）
+    [Header("Debug (まずはON推奨)")]
+    public bool debugSpawnInFront = true;      // true: カメラ前にスポーンして表示確認
     public float debugFrontMeters = 1.0f;      // カメラの何m前に出すか
     public bool debugUseServerYaw = true;      // true: yaw_degで回転 / false: カメラ向きに合わせる
 
-    [Header("Geo Placement")]
+    [Header("Geo Placement (debugSpawnInFront=false のとき使用)")]
     public float maxDistanceMeters = 30f;      // 遠すぎると見失うので、まず30m推奨
-    public float yOffsetMeters = -0.2f;        // 少し下げたい時（必要なら0に）
+    public float yOffsetMeters = 0.0f;         // 追加の上下オフセット（必要なら -0.2 等）
     [Range(0f, 1f)] public float posLerp = 0.25f;
     [Range(0f, 1f)] public float rotLerp = 0.25f;
 
     [Header("Yaw Handling")]
     public float yawOffsetDeg = 0f;            // ずれたら 90/180 など入れて補正
     public bool vrYawIsNorthBased = true;      // VR yawが「北=0,東=90」基準なら true
+
+    public enum YMode
+    {
+        EyeLevelAtAppStart,   // 起動時のカメラYを固定で使う（おすすめ）
+        EyeLevelLive,         // 毎フレームのカメラYを使う（しゃがむ等で上下する）
+        FixedY                // 固定Y（デバッグや特殊用途）
+    }
+    public YMode yMode = YMode.EyeLevelAtAppStart;
+    public float fixedY = 0f;
+
+    [Header("Humanoid Head Auto-Align (UnityChan向け)")]
+    public bool alignHumanoidHeadToEye = true;     // Humanoidなら頭を目線に合わせる
+    public float extraRootYOffsetMeters = 0f;      // 最終的な微調整（±0.1とか）
+
+    [Header("On-screen Debug")]
+    public bool showDebugOverlay = true;
 
     // -------- JSON structs (JsonUtility用) --------
     [Serializable]
@@ -47,7 +61,6 @@ public class ARRemoteHeadPlacer : MonoBehaviour
         public double z;
     }
 
-    // データあり版（従来のlatest.json）
     [Serializable]
     public class LatestData
     {
@@ -63,7 +76,6 @@ public class ARRemoteHeadPlacer : MonoBehaviour
         public double calib_theta_deg;
     }
 
-    // データなし版（{"ok":false,"reason":"no_data"}）
     [Serializable]
     public class NoDataResponse
     {
@@ -71,21 +83,30 @@ public class ARRemoteHeadPlacer : MonoBehaviour
         public string reason;
     }
 
-    private LatestData latest;          // データありのときだけ入る
+    private LatestData latest;
     private GameObject headObj;
     private Camera arCam;
 
     // Geo 変換用
     private bool geoReady = false;
     private bool geoInitStarted = false;
-    private Vector3 worldOriginPos;
+    private Vector3 worldOriginPos;            // AR起動時（原点決定時）のAR空間座標
     private double originLat;
     private double originLon;
     private Quaternion enuToWorldRot = Quaternion.identity;
 
+    // 目線基準
+    private float eyeYAtStart = 0f;
+
+    // Humanoid頭高さ（ルート→頭のY距離）
+    private bool hasHumanoidHead = false;
+    private float rootToHeadY = 0f;
+    private Animator cachedAnimator = null;
+
     // デバッグ用
     private string lastServerMsg = "";
     private float lastFetchTime = -999f;
+    private float lastComputedDistance = -1f;
 
     IEnumerator Start()
     {
@@ -101,16 +122,43 @@ public class ARRemoteHeadPlacer : MonoBehaviour
             yield break;
         }
 
-        headObj = Instantiate(headPrefab);
-        headObj.name = "RemoteHead";
+        // 起動時の目線高さを保存
+        eyeYAtStart = arCam.transform.position.y;
 
-        // /latest.json の取得開始
+        headObj = Instantiate(headPrefab);
+        headObj.name = "RemoteAvatar";
+
+        CacheHumanoidHeadOffsetIfPossible();
+
         StartCoroutine(PollLoop());
 
         // debugSpawnInFront=true のときは、位置情報の権限を要求しない（まず表示確認）
         if (!debugSpawnInFront)
         {
             yield return InitGeoOrigin();
+        }
+    }
+
+    private void CacheHumanoidHeadOffsetIfPossible()
+    {
+        hasHumanoidHead = false;
+        rootToHeadY = 0f;
+        cachedAnimator = null;
+
+        if (!alignHumanoidHeadToEye || headObj == null) return;
+
+        cachedAnimator = headObj.GetComponentInChildren<Animator>();
+        if (cachedAnimator == null) return;
+        if (!cachedAnimator.isHuman) return;
+
+        Transform head = cachedAnimator.GetBoneTransform(HumanBodyBones.Head);
+        if (head == null) return;
+
+        // 生成直後の姿勢で「ルート(このPrefabのroot) → 頭ボーン」までのY距離を取る
+        rootToHeadY = head.position.y - headObj.transform.position.y;
+        if (rootToHeadY > 0.01f)
+        {
+            hasHumanoidHead = true;
         }
     }
 
@@ -138,7 +186,7 @@ public class ARRemoteHeadPlacer : MonoBehaviour
             {
                 lastServerMsg = $"Fetch failed: {req.error}";
                 Debug.LogWarning("[ARRemoteHeadPlacer] " + lastServerMsg);
-                yield break; // 次ループでまた試す
+                yield break;
             }
 
             string text = req.downloadHandler.text?.Trim() ?? "";
@@ -149,8 +197,7 @@ public class ARRemoteHeadPlacer : MonoBehaviour
                 yield break;
             }
 
-            // no_data レスポンス判定
-            // 重要：LatestData に ok を足すと、データありJSONでも ok=false になってしまうので分岐パースする
+            // no_data 判定
             if (LooksLikeNoData(text))
             {
                 try
@@ -158,15 +205,13 @@ public class ARRemoteHeadPlacer : MonoBehaviour
                     var nd = JsonUtility.FromJson<NoDataResponse>(text);
                     if (nd != null && nd.ok == false)
                     {
-                        latest = null; // ここが重要：変な0座標へ飛ばさない
+                        latest = null;
                         lastServerMsg = $"no_data: {nd.reason}";
-                        // Debug.Log("[ARRemoteHeadPlacer] " + lastServerMsg);
                         yield break;
                     }
                 }
                 catch (Exception e)
                 {
-                    // no_data っぽいけどパース失敗 → とりあえず latest null にして安全側
                     latest = null;
                     lastServerMsg = $"no_data parse failed: {e.Message}";
                     Debug.LogWarning("[ARRemoteHeadPlacer] " + lastServerMsg);
@@ -174,7 +219,7 @@ public class ARRemoteHeadPlacer : MonoBehaviour
                 }
             }
 
-            // データありのJSONとしてパース
+            // データありとしてパース
             try
             {
                 var parsed = JsonUtility.FromJson<LatestData>(text);
@@ -185,10 +230,9 @@ public class ARRemoteHeadPlacer : MonoBehaviour
                     yield break;
                 }
 
-                // 追加の安全策：lat/lonが両方0は怪しい（no_dataが誤パースされた等）
+                // lat/lon(0,0)は怪しいので弾く
                 if (Math.Abs(parsed.lat) < 1e-9 && Math.Abs(parsed.lon) < 1e-9)
                 {
-                    // ただし本当に(0,0)の可能性はほぼ無い想定なので安全側で弾く
                     latest = null;
                     lastServerMsg = "Suspicious lat/lon (0,0). Ignored.";
                     Debug.LogWarning("[ARRemoteHeadPlacer] " + lastServerMsg);
@@ -208,9 +252,6 @@ public class ARRemoteHeadPlacer : MonoBehaviour
 
     private bool LooksLikeNoData(string json)
     {
-        // 最小限の判定（厳密パーサは使わない）
-        // {"ok": false, "reason": "no_data"} を想定
-        // ※将来サーバが "ok" を通常レスポンスに含める仕様になったらここを調整
         return json.Contains("\"ok\"") && json.Contains("\"reason\"");
     }
 
@@ -219,11 +260,10 @@ public class ARRemoteHeadPlacer : MonoBehaviour
         if (geoInitStarted) yield break;
         geoInitStarted = true;
 
-        // Location
         if (!Input.location.isEnabledByUser)
         {
             Debug.LogError("[ARRemoteHeadPlacer] Location service disabled by user.");
-            geoInitStarted = false; // リトライ可能に戻す
+            geoInitStarted = false;
             yield break;
         }
 
@@ -236,7 +276,7 @@ public class ARRemoteHeadPlacer : MonoBehaviour
         if (Input.location.status != LocationServiceStatus.Running)
         {
             Debug.LogError("[ARRemoteHeadPlacer] Location service not running.");
-            geoInitStarted = false; // リトライ可能に戻す
+            geoInitStarted = false;
             yield break;
         }
 
@@ -244,30 +284,61 @@ public class ARRemoteHeadPlacer : MonoBehaviour
         Input.compass.enabled = true;
         yield return new WaitForSeconds(0.5f);
 
-        // Origin (AR world origin point at app start)
+        // Origin（アプリ起動時のAR空間上の基準点）
         worldOriginPos = arCam.transform.position;
+        eyeYAtStart = arCam.transform.position.y;
+
         originLat = Input.location.lastData.latitude;
         originLon = Input.location.lastData.longitude;
 
-        // Align ENU to AR world yaw
-        float heading = Input.compass.trueHeading;         // north=0
-        float camYaw = arCam.transform.eulerAngles.y;      // world yaw
-        float yOffset = camYaw - heading;
-        enuToWorldRot = Quaternion.Euler(0f, yOffset, 0f);
+        // ENU(北基準) → ARワールドYaw合わせ
+        float heading = Input.compass.trueHeading;     // north=0
+        float camYaw = arCam.transform.eulerAngles.y;
+        float yRot = camYaw - heading;
+        enuToWorldRot = Quaternion.Euler(0f, yRot, 0f);
 
         geoReady = true;
 
-        Debug.Log($"[ARRemoteHeadPlacer] Geo origin set lat={originLat}, lon={originLon}, yOffset={yOffset}");
+        Debug.Log($"[ARRemoteHeadPlacer] Geo origin set lat={originLat}, lon={originLon}, yRot={yRot}");
+    }
+
+    private float ComputeTargetY()
+    {
+        float eyeY;
+        switch (yMode)
+        {
+            case YMode.EyeLevelLive:
+                eyeY = arCam.transform.position.y;
+                break;
+            case YMode.FixedY:
+                eyeY = fixedY;
+                break;
+            case YMode.EyeLevelAtAppStart:
+            default:
+                eyeY = eyeYAtStart;
+                break;
+        }
+
+        // Humanoidなら「頭が目線高さ」になるように、ルートYを下げる
+        float rootY = eyeY;
+        if (alignHumanoidHeadToEye && hasHumanoidHead)
+        {
+            rootY = eyeY - rootToHeadY;
+        }
+
+        rootY += yOffsetMeters + extraRootYOffsetMeters;
+        return rootY;
     }
 
     void Update()
     {
         if (headObj == null || arCam == null) return;
 
-        // サーバ値がまだ来てない間も「とにかく頭が見える」を優先
+        // サーバ値がまだ来てない間も「とにかく見える」を優先
         if (debugSpawnInFront)
         {
             Vector3 targetPos = arCam.transform.position + arCam.transform.forward * debugFrontMeters;
+            targetPos.y = ComputeTargetY(); // 目線基準でY決定
 
             Quaternion targetRot;
             if (debugUseServerYaw && latest != null)
@@ -288,20 +359,18 @@ public class ARRemoteHeadPlacer : MonoBehaviour
         // debug=false の場合、Geo初期化が必要
         if (!geoReady)
         {
-            // 起動後に debugSpawnInFront を false に変えた場合の保険（1回だけ起動）
             if (!geoInitStarted)
                 StartCoroutine(InitGeoOrigin());
             return;
         }
 
-        // 最新データがない（no_data等）なら更新しない
         if (latest == null) return;
 
-        // latest.lat/lon が取れてる前提
+        // latest.lat/lon を使う（pos.x/y/z は使わない）
         double latT = latest.lat;
         double lonT = latest.lon;
 
-        // origin -> target to ENU meters (approx)
+        // origin -> target を ENU meters に近似変換
         double latRad = originLat * Math.PI / 180.0;
         double metersPerDegLat = 111320.0;
         double metersPerDegLon = 111320.0 * Math.Cos(latRad);
@@ -314,14 +383,19 @@ public class ARRemoteHeadPlacer : MonoBehaviour
 
         Vector3 enu = new Vector3(east, 0f, north);
         float dist = enu.magnitude;
+        lastComputedDistance = dist;
 
         if (dist > maxDistanceMeters && dist > 0.001f)
         {
             enu = enu.normalized * maxDistanceMeters;
+            dist = maxDistanceMeters;
         }
 
         Vector3 worldOffset = enuToWorldRot * enu;
-        Vector3 targetPosGeo = worldOriginPos + worldOffset + Vector3.up * yOffsetMeters;
+
+        // XZはGeoで、Yは目線基準で決める
+        Vector3 targetPosGeo = worldOriginPos + worldOffset;
+        targetPosGeo.y = ComputeTargetY();
 
         // Rotation (yaw)
         float yawDeg = (float)latest.yaw_deg + yawOffsetDeg;
@@ -341,10 +415,22 @@ public class ARRemoteHeadPlacer : MonoBehaviour
         headObj.transform.rotation = Quaternion.Slerp(headObj.transform.rotation, targetRotGeo, rotLerp);
     }
 
-    void OnDisable()
+    void OnGUI()
     {
-        // 位置情報を使ってる場合だけ止めたいならここで判定してもOK
-        // Input.location.Stop();
-        // Input.compass.enabled = false;
+        if (!showDebugOverlay) return;
+
+        GUI.color = Color.white;
+        string s =
+            $"ARRemoteHeadPlacer\n" +
+            $"debugSpawnInFront: {debugSpawnInFront}\n" +
+            $"geoReady: {geoReady}\n" +
+            $"server: {serverBaseUrl}\n" +
+            $"last: {lastServerMsg}  (t={lastFetchTime:F1})\n" +
+            $"latest.ts: {(latest != null ? latest.ts : "null")}\n" +
+            $"latest.latlon: {(latest != null ? $"{latest.lat:F6},{latest.lon:F6}" : "-")}\n" +
+            $"dist(m): {lastComputedDistance:F2}\n" +
+            $"yMode: {yMode}  eyeYAtStart: {eyeYAtStart:F2}  headAlign:{hasHumanoidHead}\n";
+
+        GUI.Label(new Rect(10, 10, 800, 220), s);
     }
 }
